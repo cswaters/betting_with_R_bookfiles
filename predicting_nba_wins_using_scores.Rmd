@@ -1,0 +1,550 @@
+---
+title: "Predicting NBA Wins Using Scores"
+author: "Cory Waters"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Load Packages
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(caret)
+```
+
+
+### Load and Clean Raw Dataset
+
+```{r message=FALSE, warning=FALSE}
+# Load data from 2015-2016 NBA season
+df <- read_csv('data/nba16.csv')
+
+# Clean
+df <- df %>%
+  mutate(ot = ifelse(is.na(X8), '0', X8)) %>%
+  select(-Notes, -X7, -X8, -`Attend.`) 
+
+df <- df%>% 
+  left_join(tibble(ot = unique(df$ot),
+                   ot_n = c(0, 1, 2, 4))) %>%
+  select(-ot) %>% 
+  set_names(c('date','game_start','v','ptsv','h','ptsh','ot_n'))
+
+# Turn into proper 'date column'
+df$date <- mdy(substr(df$date, start = 4, stop = 15))
+
+
+df <- df %>% 
+  arrange(date, game_start)
+
+# create game ID column for joining
+df$gid <- 1:nrow(df)
+```
+
+### Calculate Baseline Prediction
+
+```{r}
+# The win percentage if we guessed the home team everytime = 59%
+baseline <- df %>% 
+  transmute((ptsh - ptsv) > 0) %>% 
+  pull() %>% 
+  mean()
+```
+
+
+### Create a 'long' version of dataset
+
+```{r}
+# The raw data has one row per game with a team as either home or away
+# This code creates a new dataframe with one row per game for each team
+# Instead of home vs away, the setup is team vs opponent.
+# This results in a dataframe with 2X as many rows
+
+nba_long <- df %>% 
+  select(gid, date, game_start, v, h, ptsh, ptsv, ot_n) %>% 
+  gather(location, team, -gid, -date, -ptsh, -ptsv,-game_start,-ot_n)
+
+nba_long <- nba_long %>%
+  left_join(nba_long %>%
+              select(gid, date, game_start, opp = team)) %>%
+  filter(team != opp) %>%
+  mutate(
+    tm_pts = ifelse(location == 'v', ptsv, ptsh),
+    opp_pts = ifelse(location == 'h', ptsv, ptsh)
+  ) %>%
+  select(-(ptsh:ptsv))
+```
+
+
+### Nest by team
+
+```{r}
+# Creates a dataframe with one row per team. 
+# There's two columns, team name and a list column 'data' which contains 
+# every game played by the team in the adjancent column for the season
+
+nba_nested <- nba_long %>% 
+  group_by(team) %>% 
+  nest()
+```
+
+
+### Engineer new features from game scores
+
+```{r}
+points_per_minute <- function(ot,pts){
+  # points per minute is a more useful metric
+  # for our purposes it's useful because
+  # it takes overtime into account 
+  mins <- 48 + (ot * 5)
+  pts / mins
+} 
+
+# The following 'function' is applied to each team's data column
+# columns prefixed with lag or last refer to previous games only
+# Since we're trying to predict the game winner we can only use
+# games played before the current game. 
+# Feel free to replace my metrics with your own
+
+add_features_nba <- . %>%
+  arrange(date) %>%
+  mutate(
+    month = month(date, label = TRUE, abbr = TRUE),
+    is_home = (location == 'h') * 1,
+    result = (tm_pts > opp_pts) * 1,
+    # win or lose
+    lag_result = lag(result),
+    # win or lose last game
+    games = row_number(date),
+    # games played (includes row)
+    lag_games_played = games - 1,
+    #games played up until game
+    w_pct = cummean(result),
+    # win percentage
+    lag_w_pct = lag(w_pct),
+    # win % up until game
+    last_5_wpct = rollmeanr(lag_w_pct, k = 5, fill = NA),
+    #win % of last 5 games
+    mov = tm_pts - opp_pts,
+    # game MOV
+    lag_mov_avg = lag(cummean(mov)),
+    # Cum MOV up until game
+    last_5_mov = rollmeanr(lag_mov_avg, k = 5, fill = NA),
+    # Cum MOV last 5 games
+    lag_avg_tm_pts = lag(cummean(tm_pts)),
+    # Season cum avg team pts
+    lag_avg_opp_pts = lag(cummean(opp_pts)),
+    # Season cum avg opp pts
+    day_between = as.numeric(date - lag(date)),
+    # days between games,
+    lag_ptspm_off = points_per_minute(ot_n, lag_avg_tm_pts),
+    #pts per min
+    lag_ptspm_def = points_per_minute(ot_n, lag_avg_opp_pts),
+    #opp pts per min
+    ppm_ratio = lag_ptspm_off / lag_ptspm_def # points per min ratio
+  )
+
+# This unnesting creates a new dataframe that includes all the new features
+nba <- nba_nested %>% 
+  mutate(features = map(data, add_features_nba)) %>% 
+  unnest(features)
+```
+
+### Going back to the old format
+
+```{r}
+# Select the features to use with the new dataset
+# Not all of the features created above are used
+# We're only using features that whose values represent
+# Games that took place before the game in the row.
+cols_for_dataset <-
+  c('lag_result',
+    'lag_w_pct',
+    'last_5_wpct',
+    'last_5_mov',
+    'lag_mov_avg',
+    'lag_ptspm_off',
+    'lag_ptspm_def',
+    'ppm_ratio',
+    'lag_games_played',
+    'day_between')
+
+
+# Since we're going back to the home vs. away format
+# we need to add a prefix that represents either home (h_) or away (v_)
+# before each feature above. We're going to do a good amount 
+# of crafty joining (which is why both vectors start with the gid column)
+
+home_col_names <-c('gid', paste0('h_', cols_for_dataset))
+away_col_names <-c('gid', paste0('v_', cols_for_dataset))
+
+nba_ext <- df %>% # use original dataset in home vs. away format
+  left_join(
+    nba %>%
+      filter(is_home == 1) %>% # add only data where team is at home
+      select(gid, one_of(cols_for_dataset)) %>% # only features listed above
+      set_names(home_col_names) # change feature names to vector prefixed with h_
+    
+  ) %>%
+  left_join(
+    nba %>%
+      filter(is_home == 0) %>% # add only data where team is away
+      select(gid, one_of(cols_for_dataset)) %>% # only features listed above
+      set_names(away_col_names) # change feature names to vector prefixed with v_
+  )
+
+# add a column for the margin of victory from home team's perspective
+# add a column for home win (1 = True, 0 = False)
+# add a column for month
+nba_ext <- nba_ext %>%
+  mutate(
+    mov = ptsh - ptsv,
+    home_win = ((mov > 0) * 1) %>% factor(),
+    month = month(date, label = TRUE, abbr = TRUE) %>% factor()
+  )
+
+# Now we have a dataset with the new features for both the home and away team
+# However, the features only focus on the performance of the team, not their
+# opposition. Now that we know the performance features of each team's opponent 
+# We can go back and calculate those features as well.
+```
+
+
+### Adding in opponent features
+
+```{r}
+
+# Going back to the dataframe in the team vs opp format with the new features
+# We filter by home and away games. For each subset we join the opponent features
+# (for home opp = v_ cols and for away opp = h_cols). 
+# We rename the feature cols prefixing them with opp_. 
+# Join the two subsets together and nest again on team
+
+at_home <- nba %>% 
+  filter(is_home == 1) %>% 
+  left_join(
+    select(nba_ext, 
+           gid,
+           opp_lag_ptspm_off = v_lag_ptspm_off,
+           opp_lag_ptspm_def = v_lag_ptspm_def,
+           opp_lag_w_pct = v_lag_w_pct,
+           opp_ppm_ratio = v_ppm_ratio)
+  )
+
+on_road <- nba %>% 
+  filter(is_home == 0) %>% 
+  left_join(
+    select(nba_ext, 
+           gid,
+           opp_lag_ptspm_off = h_lag_ptspm_off,
+           opp_lag_ptspm_def = h_lag_ptspm_def,
+           opp_lag_w_pct = h_lag_w_pct,
+           opp_ppm_ratio = h_ppm_ratio)
+  )
+
+nba_nested <- bind_rows(at_home, on_road) %>% 
+  group_by(team) %>% 
+  nest()
+
+
+# create agg opp features. These represent them avg competition a team is facing
+# the rollmeanr is the same as rollmean(allign='right') which makes sure we only
+# include previous games in our calculations
+add_opp_features <- function(df){
+  df %>% 
+    mutate(opp_def_ppm_avg = rollmeanr(opp_lag_ptspm_def,5,fill=NA),
+           opp_off_ppm_avg = rollmeanr(opp_lag_ptspm_off,5,fill=NA),
+           opp_wpct_avg = rollmeanr(opp_lag_w_pct, 5, fill=NA),
+           opp_avg_ptspm_ratio = rollmeanr(opp_ppm_ratio, 5, fill=NA),
+    )
+}
+
+# Like we did earlier we apply the feature creation function to each team's nested
+# games
+nba <- nba_nested %>% 
+  mutate(new_features = map(data, add_opp_features)) %>% 
+  unnest(new_features)
+
+```
+
+### Creating the modeling dataset
+
+```{r}
+cols_for_dataset <-
+  c('lag_result',
+    'lag_w_pct',
+    'last_5_wpct',
+    'last_5_mov',
+    'lag_mov_avg',
+    'lag_ptspm_off',
+    'lag_ptspm_def',
+    'ppm_ratio',
+    'lag_games_played',
+    'day_between',
+    names(nba)[28:35] # new opp features
+    )
+
+home_col_names <-c('gid', paste0('h_', cols_for_dataset))
+away_col_names <-c('gid', paste0('v_', cols_for_dataset))
+
+
+# We use the same technique used earlier to combine the team vs. opp data
+# with the home vs. away data
+nba_ext <- df %>%
+  left_join(
+    nba %>%
+      filter(is_home == 1) %>%
+      select(gid, one_of(cols_for_dataset)) %>%
+      set_names(home_col_names)
+    
+  ) %>%
+  left_join(
+    nba %>%
+      filter(is_home == 0) %>%
+      select(gid, one_of(cols_for_dataset)) %>%
+      set_names(away_col_names)
+  )
+
+nba_ext <- nba_ext %>%
+  mutate(
+    mov = ptsh - ptsv,
+    home_win = ((mov > 0) * 1) %>% factor(),
+    month = month(date, label = TRUE, abbr = TRUE) %>% factor()
+  )
+```
+
+
+### The modeling process, setup
+
+```{r}
+# Restrict our data to cases where each row has a value
+nba_clean <- na.omit(nba_ext) # this removes the first five games of the season for each team, since one of the features is w pct based on the previous 5 games
+
+
+# There's a couple of ways we can model who wins
+# we can model the MOV which turns this into a regression problem
+# Or we can determine if the home team wins each game 1/0 which is a classification problem
+# We're making the home_win column the target
+target <- 'home_win'
+features <- c(names(nba_clean)[c(9:43)])
+
+# a dataframe with no NA values and only the selected features and target
+model_data <- nba_clean[,c(features,target)]
+
+# Split the data into training and testing
+split_idx <-
+  createDataPartition(model_data$home_win,
+                      times = 1,
+                      p = .7,
+                      list = FALSE)
+
+
+train_nba <- model_data[split_idx, ]
+test_nba <- model_data[-split_idx, ]
+
+# Create a Cross Validation settings object to pass to the training model
+
+train_control <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 3,
+  search = "grid",
+  allowParallel = TRUE,
+  returnData = FALSE
+)
+```
+
+
+### Modeling the data
+
+```{r}
+
+# helper function to print out confusion matrix easily
+get_confusion_mtx <- function(model,df=test_nba){
+  preds <- predict(model, df)
+  confusionMatrix(df$home_win, 
+                  preds,
+                  positive = '1')
+}
+
+```
+
+
+#### Logistic Regression
+
+```{r}
+
+# A simple logistic regression model
+# before the data is modeled it is centered, scaled, predictors 
+# with near zero variance are removed and then has PCA 
+# performed on it. The PCA serves as a regularization technique and helps
+# in the fight against overfitting.
+glm_model <- train(
+  home_win ~ .,
+  data = train_nba,
+  preProc = c('center', 'scale','nzv','pca'),
+  method = 'glm',
+  trControl = train_control
+)
+
+get_confusion_mtx(glm_model)
+```
+
+#### KNN
+
+```{r}
+
+knn_model <- train(
+  home_win ~ .,
+  data = train_nba,
+  preProc = c('center', 'scale', 'nzv', 'pca'),
+  method = 'knn',
+  trControl = train_control,
+  tuneGrid = data.frame(k = seq(5, 35, 2))
+  )
+
+get_confusion_mtx(knn_model)
+```
+
+#### Random Forest
+
+```{r}
+
+rf_grid <- expand.grid(
+  mtry = c(2, 3, 5, 7, 9),
+  splitrule = c('gini', 'extratrees'),
+  min.node.size = c(1, 3, 5, 7)
+  )
+  rf_model <- train(
+  home_win ~ .,
+  data = train_nba,
+  method = "ranger",
+  tuneGrid = rf_grid,
+  trControl = train_control
+  )
+  
+get_confusion_mtx(rf_model)
+```
+
+
+### XGBoost
+
+```{r}
+library(xgboost)
+
+X_train <- xgb.DMatrix(as.matrix(train_nba %>% select(-home_win)))
+y_train <- train_nba$home_win
+
+xgb_grid <- expand.grid(nrounds = c(100,200), 
+                       max_depth = c(10, 15, 20, 25),
+                       colsample_bytree = seq(0.5, 0.9, length.out = 5),
+                       eta = 0.1,
+                       gamma=0,
+                       min_child_weight = 1,
+                       subsample = 1
+                      )
+
+xgb_model = train(
+  X_train,
+  y_train,
+  trControl = train_control,
+  tuneGrid = xgb_grid,
+  method = "xgbTree"
+  )
+
+
+# get_confusion_mtx(xgb_model)
+```
+
+#### Simple LDA Model
+
+```{r}
+
+lda_model <- train(
+  home_win ~ .,
+  data = train_nba,
+  preProc = c('center', 'scale','nzv','pca'),
+  method = 'lda',
+  trControl = train_control
+)
+
+get_confusion_mtx(lda_model)
+```
+
+#### Glmnet 
+
+```{r}
+glm_grid <- expand.grid(
+    alpha = seq(0,1,.1),
+    lambda = seq(0.0001, 0.1, length = 10))
+
+glmnet_mod <- train(
+  home_win ~ .,
+  data = train_nba,
+  preProc = c('center', 'scale','nzv','pca'),
+  method = 'glmnet',
+  trControl = train_control,
+  tuneGrid = glm_grid
+)
+
+get_confusion_mtx(glmnet_mod)
+```
+
+#### Bayes GLM
+
+```{r}
+bayes_glm_mod <- train(
+  home_win ~ .,
+  data = train_nba,
+  preProc = c('center', 'scale','nzv','pca'),
+  method = 'bayesglm',
+  trControl = train_control
+)
+
+get_confusion_mtx(bayes_glm_mod)
+```
+
+
+### Analyzing the models
+
+```{r}
+library(pROC)
+library(WVPlots)
+
+preds <- predict(glm_model, test_nba, type = 'prob')
+
+test_data <- test_nba %>% 
+  mutate(preds = preds[,2])
+
+ROCPlot(test_data, "preds","home_win","1", title = 'GLM Model')
+```
+
+```{r}
+preds <- predict(glmnet_mod, test_nba, type = 'prob')
+test_data <- test_nba %>% 
+  mutate(preds = preds[,2])
+
+ROCPlot(test_data, "preds","home_win","1", title = 'glmnet Model')
+```
+
+```{r}
+preds <- predict(rf_model, test_nba, type = 'raw')
+preds
+test_data <- test_nba %>% 
+  mutate(preds = preds[,2])
+
+ROCPlot(test_data, "preds","home_win","1", title = 'KNN Model')
+```
+
+```{r}
+preds <- predict(knn_model, test_nba, type = 'prob')
+test_data <- test_nba %>% 
+  mutate(preds = preds[,2])
+
+ROCPlot(test_data, "preds","home_win","1", title = 'KNN Model')
+```
+
