@@ -1,0 +1,264 @@
+---
+title: "Point Spread Teaser Analysis"
+author: "Cory Waters"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+
+## Load data
+
+```{r load_data, message=FALSE}
+nfl_games <- read_csv('~/Dropbox/nfl-book.csv') %>% 
+  select(seas, wk, h, v, ptsh, ptsv, sprv, ou)
+nfl_games <- filter(nfl_games, seas >= 2008)
+```
+
+## Create point spread results table
+
+```{r}
+nfl <- nfl_games %>% 
+  mutate(mov = ptsh - ptsv,
+         home_fav = as.integer(sprv >= 0),
+         road_fav = as.integer(sprv < 0),
+         home_cover = as.integer(mov > sprv),
+         road_cover = as.integer(mov < sprv),
+         fav_cover = as.integer((home_fav + home_cover == 2) | (road_fav + road_cover == 2)),
+         dog_cover = as.integer((home_fav + road_cover == 2) | (road_fav + home_cover == 2)),
+         push = as.integer(mov == sprv)) %>% 
+  mutate(spread_group = case_when( # category of spreads crossing 3/7/10/14
+    abs(sprv) >= 0 & abs(sprv) < 3 ~ "0 to 2.5",
+    abs(sprv) >= 3 & abs(sprv) < 7 ~ "3 to 6.5",
+    abs(sprv) >= 7 & abs(sprv) < 10 ~ "7 to 9.5",
+    abs(sprv) >= 10 & abs(sprv) < 14 ~ "10 to 13.5",
+    TRUE ~ "14+"
+  )) 
+```
+
+
+## Visualize spreads
+
+```{r}
+nfl %>% 
+  group_by(seas, spread_group) %>% 
+  count() %>% 
+  ggplot(aes(reorder(spread_group,n), n)) +
+  geom_point() +
+  coord_flip() +
+  labs(x = 'Spread', y = 'Number Games') +
+  facet_wrap(~seas,nrow = 4) +
+  theme_minimal()
+```
+
+Distribution of point spreads
+
+```{r}
+nfl %>%
+  group_by(spread_group, seas) %>%
+  count() %>%
+  ggplot(aes(reorder(spread_group,n), seas, fill = n)) +
+  geom_tile() +
+  scale_fill_viridis_c() +
+  theme_minimal() +
+  labs(x = 'point spread', y = 'season', fill = 'games') +
+  theme(panel.grid = element_blank()) 
+```
+
+## Fav vs Dog 
+
+```{r}
+nfl %>% 
+  summarise(tot_games = n(),
+            fav = sum(fav_cover),
+            dog = sum(dog_cover),
+            push = sum(push)
+            ) %>% 
+  transmute(fav_pct=fav/(tot_games - push),
+            dog_pct =dog/(tot_games - push))
+```
+
+## Spread results by grouping
+
+```{r}
+nfl %>% 
+  group_by(spread_group) %>% 
+  summarise(tot_games = n(),
+            fav = sum(fav_cover),
+            dog = sum(dog_cover),
+            push = sum(push)
+            ) %>% 
+  ungroup() %>% 
+  mutate(fav_pct = fav / (tot_games - push), # remove push
+         dog_pct = dog / (tot_games - push)
+         ) %>% 
+  select(spread_group, fav_pct, dog_pct, tot_games)
+
+
+
+```
+
+## Home vs Away 
+
+```{r}
+# By Home
+nfl %>% 
+  summarise(home = sum(home_cover),
+            away = sum(road_cover),
+            push = sum(push)) %>% 
+  mutate(tot_games = home + away) %>% 
+  mutate(home_pct = home / tot_games,
+         away_pct = away / tot_games) %>% 
+  select(home_pct, away_pct)
+```
+
+## Home Fav
+
+```{r}
+nfl %>% 
+  filter(push != 1) %>% # remove push
+  group_by(home_fav) %>% 
+  summarise(home = sum(home_cover),
+            away = sum(road_cover)
+            ) %>% 
+  ungroup() %>% 
+  mutate(tot_games = (home + away),
+         h_pct = home / tot_games,
+         a_pct = away / tot_games) %>% 
+  select(home_fav, h_pct, a_pct)
+```
+
+## Reshape to fav/dog from home/away
+
+```{r}
+nfl_reshape <- nfl %>% 
+  transmute(fav_team = ifelse(sprv >= 0, h, v),
+         dog_team = ifelse(sprv < 0, h, v),
+         favored = case_when(fav_team == h ~ 'H',
+                             fav_team == v ~ 'A',
+                             TRUE ~ 'E'),
+         fav_score = ifelse(fav_team == h, ptsh, ptsv),
+         dog_score = ifelse(fav_team == h, ptsv, ptsh),
+         mov_fav = fav_score - dog_score,
+         point_spread = abs(sprv),
+         total = ou)
+```
+
+## Compare spreads to MOV
+
+```{r}
+nfl_reshape %>% 
+  group_by(point_spread, mov_fav) %>% 
+  count() %>% 
+  ggplot(aes(point_spread, mov_fav,color=n)) +
+  geom_hex() +
+  scale_fill_distiller(direction = -1,palette = 7) +
+  theme_minimal()
+  
+```
+
+## View distribution of spreads and totals
+
+```{r}
+nfl_reshape %>% 
+  select(point_spread,total) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+  geom_density() +
+  facet_wrap(~key, scales = 'free') +
+  theme_minimal()
+```
+
+## Fav cover
+
+```{r}
+nfl_reshape %>% 
+  filter(mov_fav != point_spread) %>% # remove pushes
+  mutate(fav_cover = mov_fav > point_spread) %>% 
+  group_by(fav_cover) %>% 
+  tally() %>% 
+  ungroup() %>% 
+  mutate(pct = n / sum(n))
+```
+
+## How many NFL games push
+
+```{r}
+summarise(nfl_reshape, push_pct = mean(mov_fav == point_spread))
+```
+
+## Calculate teaser hit rates
+
+```{r}
+buy_pts <- c(6,6.5,7,7.5,10,13,14,17,21) # number of points to add to sprd
+
+map_df(
+  buy_pts, # pass the teaser points vector
+  ~ nfl_reshape %>%
+    mutate(
+      #fav_cover = mov_fav > point_spread,
+      with_pts_fav = mov_fav > (point_spread - .x), # subtract pts from fav
+      with_pts_dog = mov_fav < (point_spread + .x) # add points to dog
+    ) %>%
+    summarise(
+      tot_games = n(), 
+      tease_fav = sum(with_pts_fav),
+      tease_dog = sum(with_pts_dog)
+    ) %>%
+    mutate(
+      fav_wpct = tease_fav / tot_games,
+      dog_wpct = tease_dog / tot_games
+    ) %>%
+    add_column(pts = .x, .before = 1) # add the point buys as col
+) %>% 
+  mutate(combined_pct = (tease_fav + tease_dog)/(tot_games * 2)) %>% 
+  select(pts, fav_wpct, dog_wpct, combined_pct)
+
+```
+
+## Tease indivdual spreads
+
+```{r}
+
+teaser_summary_by_pts <- map_df(
+  buy_pts,
+  ~ nfl_reshape %>%
+    
+    mutate(
+      #fav_cover = mov_fav > point_spread,
+      with_pts_fav = mov_fav > (point_spread - .x),
+      with_pts_dog = mov_fav < (point_spread + .x)
+    ) %>%
+    group_by(point_spread) %>%
+    summarise(
+      tot_games = n(),
+      tease_fav = sum(with_pts_fav),
+      tease_dog = sum(with_pts_dog)
+    ) %>%
+    add_column(pts = .x, .before = 1)
+) %>%
+  select(point_spread, tot_games, pts, tease_fav, tease_dog)
+
+
+teaser_summary_by_pts
+```
+
+## Get teaser results for point spread ranges
+
+```{r}
+get_teaser_results <- function(df, .sprd_min, .sprd_max) {
+ filter(df, between(point_spread, .sprd_min, .sprd_max)) %>% 
+    group_by(pts) %>% 
+    summarise(games = sum(tot_games), 
+              tease_fav = sum(tease_fav), 
+              tease_dog = sum(tease_dog)) %>% 
+    ungroup() %>% 
+    mutate(fav_pct = tease_fav / games,
+           dog_pct = tease_dog / games,
+           combined_pct = (tease_fav + tease_dog)/(games * 2))
+}
+
+# get_teaser_results(teaser_summary_by_pts, 1.5, 2.5)
+```
+
