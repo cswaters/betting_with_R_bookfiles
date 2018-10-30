@@ -1,15 +1,10 @@
 ---
 title: "Score First Win Prop Analysis"
 author: "Cory Waters"
-output: 
-  html_document:
-    keep_md: true
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE,
-                      fig.path = "doc_figs/")
-
+knitr::opts_chunk$set(echo = TRUE)
 library(tidyverse)
 ```
 
