@@ -1,0 +1,87 @@
+---
+title: "Score First Win Prop Analysis"
+author: "Cory Waters"
+output: 
+  html_document:
+    keep_md: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      fig.path = "doc_figs/")
+
+library(tidyverse)
+```
+
+## Load data
+
+```{r load_data, message=FALSE}
+poss <- read_csv("~/Dropbox/ArmchairAnalysis/nfl_00-17/PBP.csv")
+game <- read_csv("~/Dropbox/ArmchairAnalysis/nfl_00-17/GAME.csv")
+
+recent_games <- filter(game, seas >= 2008)
+pxp <- left_join(recent_games, poss)
+
+# rm(game, poss, recent_games)
+# gc()
+```
+
+## How often do teams who score first win?
+
+```{r all_games}
+# approx 57% of the time
+pxp %>% 
+  filter(ptsh != ptsv) %>% 
+  filter(abs(pts) <= 8, ptso == 0, ptsd == 0) %>% 
+  select(gid, pts, ptso, ptsd, ptsh, ptsv, sprv) %>% 
+  mutate(score_first = ifelse(pts > 0, 1, -1),
+         win = ifelse(ptsh > ptsv, 1,-1)) %>% 
+  summarise(games = n(),
+            scr1_win = sum(score_first == win)/games)
+```
+
+## Team score first wins grouped by spread
+
+```{r grp_by_sprd}
+# Team Score First Win by Point Spread
+pxp %>% 
+  filter(ptsh != ptsv) %>% 
+  filter(abs(pts) <= 8, ptso == 0, ptsd == 0) %>% 
+  select(gid, pts, ptso, ptsd, ptsh, ptsv, sprv) %>% 
+  mutate(score_first = ifelse(pts > 0, 1, -1),
+         win = ifelse(ptsh > ptsv, 1,-1)) %>% 
+  group_by(sprv) %>% 
+  summarise(games = n(),
+            scr1_win = round(sum(score_first == win)/games,3)) %>% 
+  ungroup() %>% 
+  select(Spread = sprv, Games = games, TeamScr1Wins = scr1_win) %>% 
+  knitr::kable()
+```
+
+## Score first win by spread group
+
+```{r grp_by_sprd_viz}
+df <- pxp %>% 
+  filter(ptsh != ptsv) %>% 
+  filter(abs(pts) <= 8, ptso == 0, ptsd == 0) %>% 
+  select(gid, pts, ptso, ptsd, ptsh, ptsv, sprv) %>% 
+  mutate(score_first = ifelse(pts > 0, 1, -1),
+         win = ifelse(ptsh > ptsv, 1,-1)) %>% 
+  group_by(sprv) %>% 
+  summarise(games = n(),
+            scr1_win = sum(score_first == win)) %>% 
+  ungroup() %>% 
+  select(Spread = sprv, Games = games, TeamScr1Wins = scr1_win) %>% 
+  group_by(spr = cut_width(Spread, width=3,closed = "right")) %>% 
+  summarise(g = sum(Games), w = sum(TeamScr1Wins), wpct = round(w/g,3))
+
+ggplot(df, aes(spr, wpct,fill=g)) +
+  geom_bar(stat = 'identity', color = 'black') +
+  coord_flip() +
+  scale_y_continuous(labels = scales::percent_format()) + 
+  scale_fill_viridis_c() +
+  labs(x = 'Point Spread Range', y = 'Win Percentage',f='Games') +
+  theme_minimal()
+```
+
+
