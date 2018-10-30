@@ -11,7 +11,7 @@ library(tidyverse)
 ## Load data
 
 ```{r load_data, message=FALSE}
-nfl_games <- read_csv('~/Dropbox/nfl-book.csv') %>% 
+nfl_games <- read_csv('data/nfl-book.csv') %>% 
   select(seas, wk, h, v, ptsh, ptsv, sprv, ou)
 nfl_games <- filter(nfl_games, seas >= 2008)
 ```
