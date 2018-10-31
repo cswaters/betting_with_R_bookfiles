@@ -1,4 +1,6 @@
 library(tidyverse)
+# foundations of this analysis comes 
+# http://www.stat.cmu.edu/~ryurko/post/bayesian-baby-steps-intro/
 
 nfl <- read_csv('data/nfl-book.csv')
 
@@ -125,3 +127,15 @@ get_push_estimates(seven, p_grid)
 # windowing adds another percentage to the likelihood of a push
 p_grid[which.max(calc_push_val(three, p_grid)[n] %>% pull())]
 p_grid[which.max(calc_push_val(seven, p_grid)[n] %>% pull())]
+
+
+# Using non-flat priors
+ps_priors <- push_results %>%
+  group_by(ps) %>%
+  summarise(
+    min = min(tot_push_pct),
+    med = median(tot_push_pct),
+    max = max(tot_push_pct)
+  )
+
+# to be cont...
