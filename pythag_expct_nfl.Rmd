@@ -1,0 +1,157 @@
+---
+author: "Cory Waters"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+
+```
+
+## Load Data
+
+```{r}
+# Using data from the nflscrapr package
+# https://github.com/ryurko/nflscrapR-data
+# nfl_files <-
+#   dir(
+#   "~/Dropbox/nfl/nflscrapR-data-master/data/season_team_stats/",
+#   full.names = TRUE
+#   )
+# nfl_stats <- map(nfl_files, read_csv)
+nfl_seas <- dir("~/Dropbox/nfl/nflscrapR-data-master/data/season_games/", full.names = TRUE)
+
+nfl_games <- map(nfl_seas, read_csv)
+```
+
+## Check data
+
+```{r}
+get_shape <- function(.list_df) {
+  get_df_shape <- function(df) {
+  x <- dim(df)
+  tibble(nrow = x[1],
+  ncol = x[2])
+  }
+  map_df(.list_df, get_df_shape)
+}
+
+get_shape(nfl_games)
+```
+
+## Combine seasons into one dataframe
+
+```{r}
+nfl_games <- bind_rows(nfl_games)
+```
+
+## Check colnames
+
+```{r}
+as_tibble(names(nfl_games))
+```
+
+## Convert from home vs away to team vs opp
+
+```{r}
+
+nfl_long <- nfl_games %>%
+  select(GameID, Season, away, home, homescore, awayscore) %>%
+  gather(location, team, -GameID, -Season, -homescore, -awayscore)
+  
+  
+nfl_games <-
+  nfl_long %>%
+  left_join(nfl_long %>%
+  select(GameID, Season,  opp = team)) %>%
+  filter(team != opp) %>%
+  mutate(
+  tm_pts = ifelse(location == 'away', awayscore, homescore),
+  opp_pts = ifelse(location == 'home', awayscore, homescore)
+  ) %>%
+  select(-awayscore, -homescore)
+```
+
+## Tally wins and losses
+
+```{r}
+nfl_games <- nfl_games %>% 
+  mutate(mov = tm_pts - opp_pts,
+         result = case_when(
+           mov > 0 ~ 'win',
+           mov < 0 ~ 'loss',
+           TRUE ~ 'push'),
+         score = 1) %>% 
+  spread(result, score, fill = 0)
+
+```
+
+## Create Season Summary
+
+```{r}
+nfl_sum <- nfl_games %>% 
+  group_by(Season, team) %>% 
+  summarise_at(.vars = vars(tm_pts, opp_pts, win, loss, push), sum) %>% 
+  ungroup()
+```
+
+## Add win percentage (ties half wins)
+
+```{r}
+nfl_sum <- nfl_sum %>% 
+  mutate(games_played = win + loss + push,
+         win_pct = (win + (push * .5)) / games_played)
+```
+
+## Create Pythagorean Expectation function
+
+[Read about Pythagorean Expectation](https://en.wikipedia.org/wiki/Pythagorean_expectation)
+
+```{r}
+pythag_expect <- function(.ps, .pa, .ex = 2){
+  # .ps = points scored
+  # .pa = points against
+  # .exponent
+  # common exponents: mlb = 2, nfl = 2.37, nba = 13.91
+  .ps^.ex / (.ps^.ex + .pa^.ex)
+}
+```
+
+## Calculate Pythagorean Expectation per team
+
+[2.37 exponent taken from Mathletics by Waye Winston](https://www.amazon.com/Mathletics-Gamblers-Enthusiasts-Mathematics-Basketball/dp/0691154589)
+
+```{r}
+nfl_sum <- nfl_sum %>% 
+  mutate(pythag = pythag_expect(tm_pts, opp_pts, 2.37))
+```
+
+## Visualization expecation vs actual results
+
+```{r}
+nfl_sum %>%
+  ggplot(aes(win_pct, pythag)) +
+  geom_hex(bins=10) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_viridis_c() +
+  theme_minimal()
+```
+
+## Visualize results per team vs expectation (2017)
+
+```{r}
+nfl_sum %>% 
+  select(Season, team, pythag, win_pct) %>% 
+  filter(Season == 2017) %>% 
+  gather(stat, pct, -Season, -team) %>% 
+  ggplot(aes(reorder(team,pct),pct)) +
+  geom_point(aes(color=stat)) + 
+  coord_flip() +
+  #facet_wrap(~Season) + 
+  labs(x = 'Team', y = 'Pct') +
+  scale_y_continuous(labels = scales::percent_format()) + 
+  theme_minimal()
+```
